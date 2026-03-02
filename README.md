@@ -41,7 +41,7 @@ sheet_id, url, apps_script = execute_schema(schema, admin_email="admin@company.c
 ## Installation
 
 ```bash
-pip install -e ../SpreedSQL
+pip install spreed-sql
 ```
 
 ## API Reference
