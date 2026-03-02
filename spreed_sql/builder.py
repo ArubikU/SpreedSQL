@@ -354,6 +354,43 @@ def execute_schema(
     return sh.id, sh.url, apps_script
 
 
+def execute_schema_on_existing(
+    schema: 'Spreadsheet',
+    sheet_id: str,
+    credentials_path: str = None,
+    credentials_dict: dict = None,
+    gc: gspread.Client = None,
+    clinic_id: str = None,
+) -> tuple:
+    """
+    Escribe un esquema SpreedSQL sobre un spreadsheet existente.
+    Borra las hojas previas y recrea todo el schema.
+    Util cuando la cuota de creacion de Drive esta llena.
+    
+    Retorna: (sheet_id, sheet_url, apps_script_code)
+    """
+    client = _get_gc(credentials_path=credentials_path, credentials_dict=credentials_dict, gc=gc)
+    sh = client.open_by_key(sheet_id)
+    
+    # Borrar todas las hojas existentes (excepto la primera, que se reutiliza)
+    existing_worksheets = sh.worksheets()
+    for ws in existing_worksheets[1:]:
+        sh.del_worksheet(ws)
+    
+    # Construir todas las pestañas
+    for idx, tab in enumerate(schema.tabs):
+        _build_tab(sh, tab, is_first=(idx == 0), schema_obj=schema)
+    
+    # Construir tablas dinamicas
+    for pivot in schema.pivot_tables:
+        _build_pivot_tab(sh, pivot, schema)
+    
+    # Generar Apps Script
+    apps_script = schema.gen_apps_script(clinic_id=clinic_id or "CLINIC_ID_PLACEHOLDER")
+    
+    return sh.id, sh.url, apps_script
+
+
 # ============================================================
 #  LECTURA - SpreedSQL tambien lee, no solo construye
 # ============================================================

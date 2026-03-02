@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spreed-sql"
-version = "0.1.0"
+version = "0.1.1"
 description = "SQL-like declarative schema definitions for Google Sheets"
 readme = "README.md"
 license = {text = "MIT"}

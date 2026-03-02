@@ -113,6 +113,8 @@ class Column(BaseModel):
     Definicion de una columna en una pestaña del spreadsheet.
     Equivale a una columna en un CREATE TABLE de SQL.
     """
+    model_config = {"populate_by_name": True}
+
     name: str                                   # Nombre del header (ej: "WhatsApp")
     dtype: DataType = DataType.TEXT              # Tipo de dato
     required: bool = False                      # Si el valor es obligatorio
@@ -126,6 +128,9 @@ class Column(BaseModel):
     format_rules: Optional[List[FormatRule]] = None  # Formato condicional
     foreign_key: Optional[ForeignKey] = None    # FK: referencia a otra pestaña/columna
     edit_mode: EditMode = EditMode.OPEN         # Proteccion: open | readonly | locked
+
+    def __init__(self, name: str = None, dtype: DataType = DataType.TEXT, **kwargs):
+        super().__init__(name=name, dtype=dtype, **kwargs)
 
     def to_validation_dict(self) -> Optional[Dict[str, Any]]:
         """Genera la regla de validacion de datos de Google Sheets."""
