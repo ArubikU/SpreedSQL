@@ -4,8 +4,10 @@ Equivale a psycopg2.execute(open('schema.sql')) pero para spreadsheets.
 """
 import gspread
 from google.oauth2.service_account import Credentials
-from typing import Optional, Union
-from .models import Spreadsheet, Tab, Column, DataType, EditMode
+from contextlib import suppress
+import string
+from typing import Optional, Dict, Any
+from .models import Spreadsheet, Tab, DataType, EditMode
 
 
 SCOPES = [
@@ -15,9 +17,9 @@ SCOPES = [
 
 
 def _get_gc(
-    credentials_path: str = None,
-    credentials_dict: dict = None,
-    gc: gspread.Client = None,
+    credentials_path: Optional[str] = None,
+    credentials_dict: Optional[dict] = None,
+    gc: Optional[gspread.Client] = None,
 ) -> gspread.Client:
     """
     Autentica y retorna un cliente gspread.
@@ -45,72 +47,210 @@ def _col_letter(index: int) -> str:
     return result
 
 
+def _hex_to_rgb(hex_color: str) -> dict:
+    color = (hex_color or "").strip().lstrip("#")
+    if len(color) != 6 or any(ch not in string.hexdigits for ch in color):
+        return {"red": 0.9, "green": 0.9, "blue": 0.95}
+    return {
+        "red": int(color[0:2], 16) / 255,
+        "green": int(color[2:4], 16) / 255,
+        "blue": int(color[4:6], 16) / 255,
+    }
+
+
+def _resolve_ref_column_letter(spreadsheet_obj, ref_tab_name: str, ref_col_name: str) -> str:
+    if not spreadsheet_obj:
+        return "A"
+    tabs = getattr(spreadsheet_obj, "tabs", None)
+    if not isinstance(tabs, list):
+        return "A"
+    ref_tab = next((item for item in tabs if getattr(item, "name", None) == ref_tab_name), None)
+    if not ref_tab:
+        return "A"
+    with suppress(ValueError, TypeError):
+        ref_col_idx = ref_tab.get_column_index(ref_col_name) - 1
+        return _col_letter(ref_col_idx)
+    return "A"
+
+
+def _parse_enum_reference(values_ref: str) -> Optional[tuple]:
+    if not isinstance(values_ref, str):
+        return None
+    raw = values_ref.strip()
+    if not raw:
+        return None
+    if "." in raw:
+        left, right = raw.split(".", 1)
+        if left.strip() and right.strip():
+            return left.strip(), right.strip()
+    return None
+
+
 def _apply_column_formatting(worksheet, tab: Tab):
     """Aplica formato a los headers (negrita, colores, anchos)."""
     num_cols = len(tab.columns)
     end_col = _col_letter(num_cols - 1)
     
     # Headers en negrita
-    worksheet.format(f"A1:{end_col}1", {
-        "textFormat": {"bold": True},
-        "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.95},
-    })
+    header_bg = {"red": 0.9, "green": 0.9, "blue": 0.95}
+    text_format: Dict[str, Any] = {"bold": True}
+
+    if tab.is_native_table and tab.table_theme:
+        header_bg = _hex_to_rgb(tab.table_theme.header_bg)
+        text_format["foregroundColor"] = _hex_to_rgb(tab.table_theme.header_text)
+
+    worksheet.format(
+        f"A1:{end_col}1",
+        {
+            "textFormat": text_format,
+            "backgroundColor": header_bg,
+        },
+    )
     
     # Congelar filas/columnas
     worksheet.freeze(rows=tab.freeze_rows, cols=tab.freeze_cols)
 
 
 def _apply_data_validations(worksheet, tab: Tab, spreadsheet_obj=None):
-    """Aplica reglas de validacion de datos (dropdowns ENUM, ForeignKeys, etc.)."""
+    """Aplica validaciones usando batch_update JSON crudo (Google Sheets API v4)."""
+    requests = []
+    max_rows = max(2, int(tab.table_rows or 1000))
+
     for col_idx, col in enumerate(tab.columns):
-        col_letter = _col_letter(col_idx)
-        cell_range = f"{col_letter}2:{col_letter}1000"
-        
-        # ForeignKey: dropdown con valores de otra pestaña
+        range_obj = {
+            "sheetId": worksheet.id,
+            "startRowIndex": 1,
+            "endRowIndex": max_rows,
+            "startColumnIndex": col_idx,
+            "endColumnIndex": col_idx + 1,
+        }
+
+        # ForeignKey: dropdown con valores de otra pestaña (ONE_OF_RANGE)
         if col.foreign_key:
             fk = col.foreign_key
-            # Resolver la columna referenciada para obtener su letra
-            if spreadsheet_obj:
-                try:
-                    ref_tab = None
-                    for t in spreadsheet_obj.tabs if hasattr(spreadsheet_obj, 'tabs') else []:
-                        if t.name == fk.tab:
-                            ref_tab = t
-                            break
-                    
-                    if ref_tab:
-                        fk_col_idx = ref_tab.get_column_index(fk.column) - 1
-                        fk_col_letter = _col_letter(fk_col_idx)
-                    else:
-                        fk_col_letter = "A"  # Fallback
-                except Exception:
-                    fk_col_letter = "A"
+            fk_col_letter = _resolve_ref_column_letter(spreadsheet_obj, fk.tab, fk.column)
+            fk_ref = f"'{fk.tab}'!{fk_col_letter}2:{fk_col_letter}"
+            requests.append(
+                {
+                    "setDataValidation": {
+                        "range": range_obj,
+                        "rule": {
+                            "condition": {
+                                "type": "ONE_OF_RANGE",
+                                "values": [{"userEnteredValue": fk_ref}],
+                            },
+                            "showCustomUi": True,
+                            "strict": not fk.allow_blank,
+                        },
+                    }
+                }
+            )
+            continue
+
+        # ENUM: lista fija o referencia dinámica "Tab.Columna"
+        if col.dtype == DataType.ENUM and col.values:
+            enum_ref = _parse_enum_reference(col.values) if isinstance(col.values, str) else None
+            if enum_ref:
+                ref_tab_name, ref_col_name = enum_ref
+                ref_col_letter = _resolve_ref_column_letter(spreadsheet_obj, ref_tab_name, ref_col_name)
+                enum_ref_value = f"'{ref_tab_name}'!{ref_col_letter}2:{ref_col_letter}"
+                condition = {
+                    "type": "ONE_OF_RANGE",
+                    "values": [{"userEnteredValue": enum_ref_value}],
+                }
             else:
-                fk_col_letter = "A"
-            
-            # Crear regla de validacion con rango de la pestaña referenciada
-            fk_range = f"'{fk.tab}'!{fk_col_letter}2:{fk_col_letter}"
-            try:
-                rule = gspread.cell.DataValidationRule(
-                    gspread.cell.BooleanCondition("ONE_OF_RANGE", [fk_range]),
-                    showCustomUi=True,
-                    strict=not fk.allow_blank,
-                )
-                worksheet.set_data_validation(cell_range, rule)
-            except Exception:
-                pass
-        
-        # ENUM: dropdown con valores fijos
-        elif col.dtype == DataType.ENUM and col.values:
-            try:
-                rule = gspread.cell.DataValidationRule(
-                    gspread.cell.BooleanCondition("ONE_OF_LIST", col.values),
-                    showCustomUi=True,
-                    strict=True,
-                )
-                worksheet.set_data_validation(cell_range, rule)
-            except Exception:
-                pass
+                values_list = col.values if isinstance(col.values, list) else [str(col.values)]
+                condition = {
+                    "type": "ONE_OF_LIST",
+                    "values": [{"userEnteredValue": str(v)} for v in values_list],
+                }
+
+            requests.append(
+                {
+                    "setDataValidation": {
+                        "range": range_obj,
+                        "rule": {
+                            "condition": condition,
+                            "showCustomUi": True,
+                            "strict": not col.enum_allow_custom,
+                        },
+                    }
+                }
+            )
+
+    if requests:
+        with suppress(gspread.exceptions.GSpreadException, ValueError, TypeError):
+            worksheet.spreadsheet.batch_update({"requests": requests})
+
+
+def _apply_native_table_features(worksheet, tab: Tab):
+    if not tab.is_native_table:
+        return None
+
+    table_name = tab.table_name or f"Tabla_{tab.name.replace(' ', '_')}"
+    row_end = max(2, int(tab.table_rows or 1000))
+    col_count = len(tab.columns) + (len(tab.computed_columns) if tab.computed_columns else 0)
+    col_end = max(1, col_count)
+
+    requests = []
+    if tab.filter is None or tab.filter.enabled:
+        requests.append(
+            {
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId": worksheet.id,
+                            "startRowIndex": 0,
+                            "endRowIndex": row_end,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": col_end,
+                        }
+                    }
+                }
+            }
+        )
+
+    banded_range = {
+        "range": {
+            "sheetId": worksheet.id,
+            "startRowIndex": 0,
+            "endRowIndex": row_end,
+            "startColumnIndex": 0,
+            "endColumnIndex": col_end,
+        },
+        "headerColor": _hex_to_rgb(tab.table_theme.header_bg) if tab.table_theme else {"red": 0.87, "green": 0.90, "blue": 0.98},
+        "firstBandColor": _hex_to_rgb(tab.table_theme.stripe_bg) if tab.table_theme else {"red": 0.96, "green": 0.97, "blue": 0.99},
+        "secondBandColor": {"red": 1, "green": 1, "blue": 1},
+    }
+    requests.append({"addBanding": {"bandedRange": banded_range}})
+    requests.append(
+        {
+            "addNamedRange": {
+                "namedRange": {
+                    "name": table_name,
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "startRowIndex": 0,
+                        "endRowIndex": row_end,
+                        "startColumnIndex": 0,
+                        "endColumnIndex": col_end,
+                    },
+                }
+            }
+        }
+    )
+
+    with suppress(gspread.exceptions.GSpreadException, ValueError, TypeError):
+        worksheet.spreadsheet.batch_update({"requests": requests})
+
+    return {
+        "table_name": table_name,
+        "sheet_name": tab.name,
+        "sheet_id": worksheet.id,
+        "range_a1": f"A1:{_col_letter(col_end - 1)}{row_end}",
+        "row_end": row_end,
+        "col_end": col_end,
+    }
 
 
 def _apply_computed_columns(worksheet, tab: Tab):
@@ -131,10 +271,8 @@ def _apply_computed_columns(worksheet, tab: Tab):
 def _apply_auto_filter(worksheet, tab: Tab):
     """Activa el filtro automatico en los headers."""
     if tab.filter and tab.filter.enabled:
-        try:
+        with suppress(gspread.exceptions.GSpreadException, ValueError, TypeError):
             worksheet.set_basic_filter()
-        except Exception:
-            pass
 
 
 def _apply_formulas(worksheet, tab: Tab):
@@ -149,24 +287,22 @@ def _hide_columns(worksheet, tab: Tab):
     """Oculta columnas marcadas como hidden."""
     for col_idx, col in enumerate(tab.columns):
         if col.hidden:
-            try:
-                body = {
-                    "requests": [{
-                        "updateDimensionProperties": {
-                            "range": {
-                                "sheetId": worksheet.id,
-                                "dimension": "COLUMNS",
-                                "startIndex": col_idx,
-                                "endIndex": col_idx + 1,
-                            },
-                            "properties": {"hiddenByUser": True},
-                            "fields": "hiddenByUser",
-                        }
-                    }]
-                }
+            body = {
+                "requests": [{
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": worksheet.id,
+                            "dimension": "COLUMNS",
+                            "startIndex": col_idx,
+                            "endIndex": col_idx + 1,
+                        },
+                        "properties": {"hiddenByUser": True},
+                        "fields": "hiddenByUser",
+                    }
+                }]
+            }
+            with suppress(gspread.exceptions.GSpreadException, ValueError, TypeError):
                 worksheet.spreadsheet.batch_update(body)
-            except Exception:
-                pass
 
 
 def _protect_columns(worksheet, tab: Tab):
@@ -227,10 +363,8 @@ def _protect_columns(worksheet, tab: Tab):
             })
     
     if requests:
-        try:
+        with suppress(gspread.exceptions.GSpreadException, ValueError, TypeError):
             worksheet.spreadsheet.batch_update({"requests": requests})
-        except Exception:
-            pass
 
 
 def _build_tab(spreadsheet: gspread.Spreadsheet, tab: Tab, is_first: bool = False, schema_obj=None):
@@ -243,11 +377,11 @@ def _build_tab(spreadsheet: gspread.Spreadsheet, tab: Tab, is_first: bool = Fals
         if tab.computed_columns:
             total_cols += len(tab.computed_columns)
         worksheet = spreadsheet.add_worksheet(
-            title=tab.name, rows="1000", cols=str(max(total_cols, 10))
+            title=tab.name, rows=1000, cols=max(total_cols, 10)
         )
     
     # 1. Escribir headers
-    worksheet.update("A1", [tab.headers])
+    worksheet.update(values=[tab.headers], range_name="A1")
     
     # 2. Formato de headers
     _apply_column_formatting(worksheet, tab)
@@ -261,6 +395,8 @@ def _build_tab(spreadsheet: gspread.Spreadsheet, tab: Tab, is_first: bool = Fals
     # 5. Columnas computadas (ARRAYFORMULA)
     _apply_computed_columns(worksheet, tab)
     
+    table_meta = _apply_native_table_features(worksheet, tab)
+
     # 6. Auto-filtro
     _apply_auto_filter(worksheet, tab)
     
@@ -270,7 +406,7 @@ def _build_tab(spreadsheet: gspread.Spreadsheet, tab: Tab, is_first: bool = Fals
     # 8. Proteger columnas readonly/locked
     _protect_columns(worksheet, tab)
     
-    return worksheet
+    return worksheet, table_meta
 
 
 def _build_pivot_tab(spreadsheet: gspread.Spreadsheet, pivot, schema):
@@ -281,7 +417,7 @@ def _build_pivot_tab(spreadsheet: gspread.Spreadsheet, pivot, schema):
     source_tab = schema.get_tab(pivot.source_tab)
     
     worksheet = spreadsheet.add_worksheet(
-        title=pivot.name, rows="100", cols="20"
+        title=pivot.name, rows=100, cols=20
     )
     
     # Construir QUERY formula
@@ -315,10 +451,11 @@ def _build_pivot_tab(spreadsheet: gspread.Spreadsheet, pivot, schema):
 def execute_schema(
     schema: Spreadsheet,
     admin_email: str,
-    credentials_path: str = None,
-    credentials_dict: dict = None,
-    gc: gspread.Client = None,
-    clinic_id: str = None,
+    credentials_path: Optional[str] = None,
+    credentials_dict: Optional[dict] = None,
+    gc: Optional[gspread.Client] = None,
+    clinic_id: Optional[str] = None,
+    return_metadata: bool = False,
     **name_vars,
 ) -> tuple:
     """
@@ -331,7 +468,9 @@ def execute_schema(
       - credentials_dict: dict del JSON (ej: json.loads(os.getenv('GSHEETS_CREDS')))
       - gc: cliente gspread pre-autenticado
     
-    Retorna: (sheet_id, sheet_url, apps_script_code)
+        Retorna:
+            - default: (sheet_id, sheet_url, apps_script_code)
+            - con return_metadata=True: (sheet_id, sheet_url, apps_script_code, metadata)
     """
     client = _get_gc(credentials_path=credentials_path, credentials_dict=credentials_dict, gc=gc)
     
@@ -340,9 +479,13 @@ def execute_schema(
     sh = client.create(resolved_name)
     sh.share(admin_email, perm_type="user", role="writer")
     
+    table_metadata = {"tables": []}
+
     # Construir todas las pestañas
     for idx, tab in enumerate(schema.tabs):
-        _build_tab(sh, tab, is_first=(idx == 0), schema_obj=schema)
+        _, table_meta = _build_tab(sh, tab, is_first=(idx == 0), schema_obj=schema)
+        if table_meta:
+            table_metadata["tables"].append(table_meta)
     
     # Construir tablas dinamicas
     for pivot in schema.pivot_tables:
@@ -351,23 +494,28 @@ def execute_schema(
     # Generar Apps Script con clinic_id real si se proporciona
     apps_script = schema.gen_apps_script(clinic_id=clinic_id or "CLINIC_ID_PLACEHOLDER")
     
+    if return_metadata:
+        return sh.id, sh.url, apps_script, table_metadata
     return sh.id, sh.url, apps_script
 
 
 def execute_schema_on_existing(
     schema: 'Spreadsheet',
     sheet_id: str,
-    credentials_path: str = None,
-    credentials_dict: dict = None,
-    gc: gspread.Client = None,
-    clinic_id: str = None,
+    credentials_path: Optional[str] = None,
+    credentials_dict: Optional[dict] = None,
+    gc: Optional[gspread.Client] = None,
+    clinic_id: Optional[str] = None,
+    return_metadata: bool = False,
 ) -> tuple:
     """
     Escribe un esquema SpreedSQL sobre un spreadsheet existente.
     Borra las hojas previas y recrea todo el schema.
     Util cuando la cuota de creacion de Drive esta llena.
     
-    Retorna: (sheet_id, sheet_url, apps_script_code)
+        Retorna:
+            - default: (sheet_id, sheet_url, apps_script_code)
+            - con return_metadata=True: (sheet_id, sheet_url, apps_script_code, metadata)
     """
     client = _get_gc(credentials_path=credentials_path, credentials_dict=credentials_dict, gc=gc)
     sh = client.open_by_key(sheet_id)
@@ -377,9 +525,13 @@ def execute_schema_on_existing(
     for ws in existing_worksheets[1:]:
         sh.del_worksheet(ws)
     
+    table_metadata = {"tables": []}
+
     # Construir todas las pestañas
     for idx, tab in enumerate(schema.tabs):
-        _build_tab(sh, tab, is_first=(idx == 0), schema_obj=schema)
+        _, table_meta = _build_tab(sh, tab, is_first=(idx == 0), schema_obj=schema)
+        if table_meta:
+            table_metadata["tables"].append(table_meta)
     
     # Construir tablas dinamicas
     for pivot in schema.pivot_tables:
@@ -388,6 +540,8 @@ def execute_schema_on_existing(
     # Generar Apps Script
     apps_script = schema.gen_apps_script(clinic_id=clinic_id or "CLINIC_ID_PLACEHOLDER")
     
+    if return_metadata:
+        return sh.id, sh.url, apps_script, table_metadata
     return sh.id, sh.url, apps_script
 
 
@@ -399,9 +553,9 @@ def read_tab(
     schema: Spreadsheet,
     tab_name: str,
     sheet_id: str,
-    credentials_path: str = None,
-    credentials_dict: dict = None,
-    gc: gspread.Client = None,
+    credentials_path: Optional[str] = None,
+    credentials_dict: Optional[dict] = None,
+    gc: Optional[gspread.Client] = None,
 ) -> list:
     """
     Lee los datos de una pestaña usando el schema para validar headers.
@@ -419,8 +573,8 @@ def read_tab(
     
     try:
         ws = sh.worksheet(tab_name)
-    except gspread.exceptions.WorksheetNotFound:
-        raise ValueError(f"Pestaña '{tab_name}' no encontrada en el spreadsheet.")
+    except Exception as exc:
+        raise ValueError(f"Pestaña '{tab_name}' no encontrada en el spreadsheet.") from exc
     
     # Validar headers
     actual_headers = ws.row_values(1)
@@ -435,9 +589,9 @@ def read_tab(
 def read_all(
     schema: Spreadsheet,
     sheet_id: str,
-    credentials_path: str = None,
-    credentials_dict: dict = None,
-    gc: gspread.Client = None,
+    credentials_path: Optional[str] = None,
+    credentials_dict: Optional[dict] = None,
+    gc: Optional[gspread.Client] = None,
 ) -> dict:
     """
     Lee todas las pestañas definidas en el schema.

@@ -1,7 +1,7 @@
 from .models import (
     Spreadsheet, Tab, Column, DataType, EditMode, FormatRule,
     Formula, Filter, SortSpec, PivotField, PivotTable, ComputedColumn,
-    ForeignKey, Trigger, TriggerType,
+    ForeignKey, Trigger, TriggerType, TableTheme,
     OnEdit, OnChange, OnSchedule, OnFormSubmit, OnThreshold,
 )
 from .builder import execute_schema, execute_schema_on_existing, read_tab, read_all
@@ -10,7 +10,7 @@ from .validator import validate_schema
 __all__ = [
     "Spreadsheet", "Tab", "Column", "DataType", "EditMode", "FormatRule",
     "Formula", "Filter", "SortSpec", "PivotField", "PivotTable", "ComputedColumn",
-    "ForeignKey", "Trigger", "TriggerType",
+    "ForeignKey", "Trigger", "TriggerType", "TableTheme",
     "OnEdit", "OnChange", "OnSchedule", "OnFormSubmit", "OnThreshold",
     "execute_schema", "execute_schema_on_existing", "read_tab", "read_all", "validate_schema",
 ]

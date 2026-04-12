@@ -3,7 +3,7 @@ SpreedSQL - Modelos declarativos para esquemas de Google Sheets.
 Equivalente a los modelos de un ORM (SQLAlchemy) pero para hojas de calculo.
 """
 from enum import Enum
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Union, cast
 from pydantic import BaseModel, Field
 
 
@@ -37,6 +37,13 @@ class FormatRule(BaseModel):
     value: str                    # Valor de comparacion
     bg_color: Optional[str] = None  # Color de fondo hex (#FF0000)
     text_color: Optional[str] = None  # Color de texto hex
+
+
+class TableTheme(BaseModel):
+    """Tema visual para una tabla nativa de Google Sheets."""
+    header_bg: str = "#DDE6F9"
+    header_text: str = "#1F1F1F"
+    stripe_bg: str = "#F6F8FC"
 
 
 class Formula(BaseModel):
@@ -120,7 +127,8 @@ class Column(BaseModel):
     required: bool = False                      # Si el valor es obligatorio
     hidden: bool = False                        # Columna oculta (para IDs internos)
     default: Optional[str] = None               # Valor por defecto
-    values: Optional[List[str]] = None          # Valores permitidos (solo ENUM)
+    values: Optional[Union[List[str], str]] = None  # ENUM: lista fija o referencia "Tab.Columna"
+    enum_allow_custom: bool = False             # Si True, permite escribir fuera del dropdown
     auto: bool = False                          # Auto-rellenar (timestamps, IDs)
     auto_formula: Optional[str] = None          # Formula de Google Sheets si auto=True
     width: Optional[int] = None                 # Ancho en pixeles (None = auto)
@@ -129,16 +137,17 @@ class Column(BaseModel):
     foreign_key: Optional[ForeignKey] = None    # FK: referencia a otra pestaña/columna
     edit_mode: EditMode = EditMode.OPEN         # Proteccion: open | readonly | locked
 
-    def __init__(self, name: str = None, dtype: DataType = DataType.TEXT, **kwargs):
+    def __init__(self, name: Optional[str] = None, dtype: DataType = DataType.TEXT, **kwargs):
         super().__init__(name=name, dtype=dtype, **kwargs)
 
     def to_validation_dict(self) -> Optional[Dict[str, Any]]:
         """Genera la regla de validacion de datos de Google Sheets."""
-        if self.dtype == DataType.ENUM and self.values:
+        if self.dtype == DataType.ENUM and isinstance(self.values, list) and self.values:
+            values = [str(v) for v in cast(List[str], self.values or [])]
             return {
                 "type": "ONE_OF_LIST",
-                "values": [{"userEnteredValue": v} for v in self.values],
-                "strict": True,
+                "values": [{"userEnteredValue": v} for v in values],
+                "strict": not self.enum_allow_custom,
                 "showCustomUi": True
             }
         elif self.dtype == DataType.BOOLEAN:
@@ -181,7 +190,7 @@ class Trigger(BaseModel):
 
 # Alias de conveniencia para crear triggers rápido
 def OnEdit(column: str, webhook_url: str, event_name: str = "sheet.row.update",
-          include_columns: List[str] = None) -> Trigger:
+          include_columns: Optional[List[str]] = None) -> Trigger:
     """Crea un trigger ON_EDIT para una columna específica."""
     return Trigger(
         type=TriggerType.ON_EDIT,
@@ -192,7 +201,7 @@ def OnEdit(column: str, webhook_url: str, event_name: str = "sheet.row.update",
     )
 
 def OnChange(webhook_url: str, event_name: str = "sheet.any.change",
-            include_columns: List[str] = None) -> Trigger:
+            include_columns: Optional[List[str]] = None) -> Trigger:
     """Crea un trigger ON_CHANGE para cualquier edición en la pestaña."""
     return Trigger(
         type=TriggerType.ON_CHANGE,
@@ -202,7 +211,7 @@ def OnChange(webhook_url: str, event_name: str = "sheet.any.change",
     )
 
 def OnSchedule(webhook_url: str, cron_expression: str,
-              event_name: str = "sheet.scheduled", description: str = None) -> Trigger:
+              event_name: str = "sheet.scheduled", description: Optional[str] = None) -> Trigger:
     """Crea un trigger ON_SCHEDULE basado en cron (Time-driven Google trigger)."""
     return Trigger(
         type=TriggerType.ON_SCHEDULE,
@@ -213,7 +222,7 @@ def OnSchedule(webhook_url: str, cron_expression: str,
     )
 
 def OnFormSubmit(webhook_url: str, event_name: str = "sheet.form.submit",
-               include_columns: List[str] = None) -> Trigger:
+               include_columns: Optional[List[str]] = None) -> Trigger:
     """Crea un trigger ON_FORM_SUBMIT para Google Forms vinculados."""
     return Trigger(
         type=TriggerType.ON_FORM_SUBMIT,
@@ -224,7 +233,7 @@ def OnFormSubmit(webhook_url: str, event_name: str = "sheet.form.submit",
 
 def OnThreshold(column: str, webhook_url: str, threshold_value: float,
                direction: str = "above", event_name: str = "sheet.threshold",
-               include_columns: List[str] = None) -> Trigger:
+               include_columns: Optional[List[str]] = None) -> Trigger:
     """Crea un trigger ON_THRESHOLD que se dispara cuando un valor supera/baja de un umbral."""
     return Trigger(
         type=TriggerType.ON_THRESHOLD,
@@ -252,6 +261,10 @@ class Tab(BaseModel):
     filter: Optional[Filter] = None             # Auto-filtro en headers
     sorts: Optional[List[SortSpec]] = None      # Ordenamiento por defecto
     computed_columns: Optional[List[ComputedColumn]] = None  # Columnas calculadas con ARRAYFORMULA
+    is_native_table: bool = False               # Simula tabla nativa: filter + banding + named range
+    table_name: Optional[str] = None            # Nombre del named range (ej: Tabla_1)
+    table_rows: int = 1000                      # Alto del rango de tabla para filter/banding
+    table_theme: Optional[TableTheme] = None    # Tema visual para la tabla
 
     @property
     def headers(self) -> List[str]:
@@ -280,15 +293,35 @@ class Spreadsheet(BaseModel):
     tabs: List[Tab] = Field(default_factory=list)
     pivot_tables: List[PivotTable] = Field(default_factory=list)  # Tablas dinamicas/vistas
 
-    def tab(self, name: str, *columns: Column, triggers: List[Trigger] = None,
-            freeze_rows: int = 1, freeze_cols: int = 0, color: str = None, 
-            protected: bool = False, filter: Filter = None,
-            sorts: List[SortSpec] = None,
-            computed_columns: List[ComputedColumn] = None) -> "Spreadsheet":
+    def tab(
+        self,
+        name: str,
+        *columns: Column,
+        triggers: Optional[List[Trigger]] = None,
+        freeze_rows: int = 1,
+        freeze_cols: int = 0,
+        color: Optional[str] = None,
+        protected: bool = False,
+        tab_filter: Optional[Filter] = None,
+        sorts: Optional[List[SortSpec]] = None,
+        computed_columns: Optional[List[ComputedColumn]] = None,
+        is_native_table: bool = False,
+        table_name: Optional[str] = None,
+        table_rows: int = 1000,
+        table_theme: Optional[TableTheme] = None,
+        **kwargs,
+    ) -> "Spreadsheet":
         """
         API fluida para agregar pestañas al esquema.
         Uso: schema.tab("Citas", Column(...), ..., triggers=[OnEdit(...), OnChange(...)])
         """
+        legacy_filter = kwargs.pop("filter", None)
+        if kwargs:
+            unknown = ", ".join(kwargs.keys())
+            raise TypeError(f"Argumentos no soportados en tab(): {unknown}")
+
+        resolved_filter = tab_filter if tab_filter is not None else legacy_filter
+
         t = Tab(
             name=name,
             columns=list(columns),
@@ -297,11 +330,17 @@ class Spreadsheet(BaseModel):
             freeze_cols=freeze_cols,
             color=color,
             protected=protected,
-            filter=filter,
+            filter=resolved_filter,
             sorts=sorts,
             computed_columns=computed_columns,
+            is_native_table=is_native_table,
+            table_name=table_name,
+            table_rows=table_rows,
+            table_theme=table_theme,
         )
-        self.tabs.append(t)
+        tabs = cast(List[Tab], self.tabs)
+        tabs.append(t)
+        self.tabs = tabs
         return self  # Permite encadenamiento
 
     def get_tab(self, name: str) -> Tab:
